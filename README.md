@@ -341,7 +341,12 @@ Canvas2D, and the renderer is its own module, so a pixi/WebGL renderer could
 replace it. It supports xterm-style VT, 256-color and truecolor SGR (`;` and
 `:` forms), the alternate screen, scroll regions, wide characters and emoji,
 box drawing drawn as shapes, mouse modes 1000/1002/1003/1006, bracketed
-paste, focus events, copy on select, Ctrl+C (with a selection) / Ctrl+V, synchronized output, OSC 8/52/10/11, and the **kitty
+paste, focus events, copy on select, Ctrl+C (with a selection) / Ctrl+V, synchronized output, OSC 52/10/11, links (a click, a tap or Ctrl/Cmd+click opens
+an OSC 8 hyperlink or a plain URL, http and https only, and a link that a
+click would open is underlined with a pointer cursor on hover. While a
+program has mouse reporting on, a plain click goes to the program and
+Ctrl/Cmd+click still opens the link (hold Ctrl/Cmd to see it). The
+`clickOpensLinks: false` option limits it to Ctrl/Cmd+click), and the **kitty
 graphics protocol**: direct transmission, PNG, RGB(A), zlib, chunking,
 place, delete and query. `kitten icat`, `timg`, `chafa -f kitty` and similar
 tools work as long as they send the image data inline (`t=d`).
@@ -352,11 +357,45 @@ protocol is not implemented. Keys: Ctrl+Shift+C/V copy and paste,
 Ctrl+Shift+T opens a new session, Ctrl+Shift+PgUp/PgDn switch tabs.
 `/termdemo.html` shows the terminal with no backend.
 
+## Embedding the browser client
+
+Another web app can use the terminal and the wosh client without wash-web or
+washd. Copy `web/static/wosh.js` and `web/static/term/` as they are: plain ES
+modules with relative imports only, no dependencies, no build step. Both
+export the same `VERSION`. Record it, and the commit, when you vendor them.
+
+```js
+import { Terminal } from './term/index.js';
+import { WoshSession } from './wosh.js';
+
+const term = new Terminal(el, { fontSize: 14 });
+const s = new WoshSession(null, sessionId, term, {
+  cid,                       // this tab, kept across reloads (sessionStorage) so it keeps control
+  signal: async (offer) => { // {sdp, cols, rows, rx_out, cid, take, join, ice, relay}
+    // your server writes {"t":"offer", key, sdp, cols, rows, rx_out, cid, join, ice, relay}
+    // to the daemon's control socket: the daemon reads join, not take
+    const r = await fetch(`/api/term/${sessionId}/offer`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(offer),
+    });
+    if (r.status === 404) throw new Error('session gone'); // ends the session
+    if (!r.ok) throw new Error(`offer failed (${r.status})`); // retried
+    return (await r.json()).sdp;
+  },
+  ice: [],                   // default: host candidates only. relay: true for TURN only
+  onState: (st) => {}, onExit: (code, why) => {},
+});
+s.connect();
+```
+
+Without a manager the transport is WebRTC only, and chained hops and the
+build streams they need are not available. The signal function times out
+after 30 s and is then retried.
+
 ## Tests
 
 ```sh
 go test ./...                              # includes internal/e2e (needs ../wosh/bin/wosh or $WASH_TEST_WOSH)
-node --test web/test/term/*.test.mjs web/test/wosh/*.test.mjs
+node --test web/test/term/*.test.mjs web/test/wash/*.test.mjs web/test/wosh/*.test.mjs
 ```
 
 The e2e test runs wash-web and washd with real wosh daemons, using a

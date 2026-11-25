@@ -233,3 +233,274 @@ test('playback terminal: clicks select text even in mouse mode, no clipboard wri
     Object.defineProperty(globalThis, 'navigator', { value: nav, configurable: true });
   }
 });
+
+test('write with replies: false draws but does not answer queries', async () => {
+  const el = new El('div');
+  const t = new Terminal(el, { fontSize: 15 });
+  const sent = [];
+  t.onData = (u8) => sent.push(new TextDecoder().decode(u8));
+  t.write('old\x1b[5n\x1b[c\x1b[>q\x1b]11;?\x07', { replies: false });
+  assert.deepEqual(sent, [], 'replayed queries stay unanswered');
+  assert.ok(t.screen.buf.lines[0].text().startsWith('old'), 'replayed text is drawn');
+  t.write('\x1b[5n');
+  assert.deepEqual(sent, ['\x1b[0n'], 'live queries are answered');
+  t.dispose();
+});
+
+test('a write from a callback during a quiet write keeps the rest quiet', () => {
+  const el = new El('div');
+  const t = new Terminal(el, { fontSize: 15 });
+  const sent = [];
+  t.onData = (u8) => sent.push(new TextDecoder().decode(u8));
+  t.onTitle = () => t.write('[t]');
+  t.onBell = () => t.write('!');
+  t.write('\x1b]0;title\x07\x1b[5n\x07\x1b[c', { replies: false });
+  assert.deepEqual(sent, [], 'queries after the nested writes stay unanswered');
+  t.write('\x1b[5n');
+  assert.deepEqual(sent, ['\x1b[0n'], 'a live write still answers');
+  t.dispose();
+});
+
+test('write with replies: false does not set the clipboard (OSC 52)', () => {
+  const el = new El('div');
+  const t = new Terminal(el, { fontSize: 15 });
+  const copied = [];
+  const nav = globalThis.navigator;
+  Object.defineProperty(globalThis, 'navigator', { value: { clipboard: { writeText: async (s) => { copied.push(s); } } }, configurable: true });
+  try {
+    t.write('\x1b]52;c;b2xk\x07', { replies: false });
+    assert.deepEqual(copied, [], 'a replayed yank leaves the clipboard alone');
+    t.write('\x1b]52;c;bmV3\x07');
+    assert.deepEqual(copied, ['new'], 'a live yank sets it');
+  } finally {
+    Object.defineProperty(globalThis, 'navigator', { value: nav, configurable: true });
+    t.dispose();
+  }
+});
+
+test('Ctrl+click opens OSC 8 links only for http and https', async () => {
+  const el = new El('div');
+  const t = new Terminal(el, { fontSize: 15 });
+  const opened = [];
+  const prev = window.open;
+  window.open = (u) => { opened.push(u); };
+  try {
+    const click = () => {
+      t.canvas.dispatch('mousedown', { button: 0, detail: 1, ctrlKey: true, clientX: 1, clientY: 1 });
+      window.dispatch('mouseup', { button: 0, clientX: 1, clientY: 1 });
+    };
+    t.write('\x1b]8;;javascript:alert(1)\x07evil\x1b]8;;\x07\r');
+    click();
+    assert.deepEqual(opened, [], 'javascript: link not opened');
+    t.write('\x1b]8;;https://example.com/x\x07good\x1b]8;;\x07\r');
+    click();
+    assert.deepEqual(opened, ['https://example.com/x']);
+  } finally {
+    window.open = prev;
+    t.dispose();
+  }
+});
+
+test('Ctrl+click opens a plain URL, also one wrapped across lines', async () => {
+  const el = new El('div'); // 100 x 20 cells
+  const t = new Terminal(el, { fontSize: 15 });
+  const opened = [];
+  const prev = window.open;
+  window.open = (u) => { opened.push(u); };
+  const click = (col, row) => {
+    const x = col * 9 + 1, y = row * 18 + 1;
+    t.canvas.dispatch('mousedown', { button: 0, detail: 1, ctrlKey: true, clientX: x, clientY: y });
+    window.dispatch('mouseup', { button: 0, clientX: x, clientY: y });
+  };
+  try {
+    t.write('see https://example.com/docs. ok\r\n');
+    click(10, 0);
+    assert.deepEqual(opened, ['https://example.com/docs']);
+    click(1, 0);
+    assert.equal(opened.length, 1, 'plain text is not a link');
+    // 90 columns of text, then a URL that soft-wraps onto the next row
+    t.write('x'.repeat(90) + ' https://example.com/' + 'long'.repeat(5) + '\r\n');
+    click(3, 2);
+    assert.deepEqual(opened.at(-1), 'https://example.com/' + 'long'.repeat(5), 'click on the wrapped half');
+    click(95, 1);
+    assert.equal(opened.length, 3, 'click on the first half');
+    assert.equal(opened.at(-1), opened.at(-2));
+  } finally {
+    window.open = prev;
+    t.dispose();
+  }
+});
+
+test('Ctrl+click on a plain URL: concealed text, unsafe OSC 8', async () => {
+  const el = new El('div'); // 100 x 20 cells
+  const t = new Terminal(el, { fontSize: 15 });
+  const opened = [];
+  const prev = window.open;
+  window.open = (u) => { opened.push(u); };
+  const click = (col, row) => {
+    const x = col * 9 + 1, y = row * 18 + 1;
+    t.canvas.dispatch('mousedown', { button: 0, detail: 1, ctrlKey: true, clientX: x, clientY: y });
+    window.dispatch('mouseup', { button: 0, clientX: x, clientY: y });
+  };
+  try {
+    t.write('https://good.example\x1b[8m.evil.test/\x1b[0m\r\n');
+    click(3, 0);
+    assert.equal(opened.at(-1), 'https://good.example/', 'concealed text is not part of the URL');
+    // an OSC 8 target that may not be opened falls back to the URL in its text
+    t.write('\x1b]8;;javascript:alert(1)\x07https://example.com/t\x1b]8;;\x07\r\n');
+    click(3, 1);
+    assert.equal(opened.at(-1), 'https://example.com/t');
+    assert.equal(opened.length, 2);
+  } finally {
+    window.open = prev;
+    t.dispose();
+  }
+});
+
+test('a plain click opens a link; Shift-click and clickOpensLinks: false do not', async () => {
+  const el = new El('div'); // 100 x 20 cells, 9 x 18 px
+  const t = new Terminal(el, { fontSize: 15 });
+  const opened = [];
+  const prev = window.open;
+  window.open = (u) => { opened.push(u); };
+  const click = (col, row, mods = {}) => {
+    const x = col * 9 + 1, y = row * 18 + 1;
+    t.canvas.dispatch('mousedown', { button: 0, detail: 1, clientX: x, clientY: y, ...mods });
+    window.dispatch('mouseup', { button: 0, clientX: x, clientY: y });
+  };
+  try {
+    t.write('go https://example.com/a now\r\n');
+    t.write('\x1b]8;;javascript:alert(1)\x07evil\x1b]8;;\x07\r\n');
+    click(5, 0);
+    assert.deepEqual(opened, ['https://example.com/a'], 'plain click');
+    click(0, 0);
+    assert.equal(opened.length, 1, 'plain text is not a link');
+    click(1, 1);
+    assert.equal(opened.length, 1, 'an unsafe OSC 8 link still does not open');
+    click(5, 0, { shiftKey: true });
+    assert.equal(opened.length, 1, 'Shift-click only selects');
+    t.setOptions({ clickOpensLinks: false });
+    click(5, 0);
+    assert.equal(opened.length, 1, 'off: a plain click does not open');
+    click(5, 0, { ctrlKey: true });
+    assert.equal(opened.length, 2, 'off: Ctrl+click still opens');
+  } finally {
+    window.open = prev;
+    t.dispose();
+  }
+});
+
+test('a tap on a link opens it without the keyboard; a tap elsewhere focuses', () => {
+  const el = new El('div');
+  const t = new Terminal(el, { fontSize: 15 });
+  const opened = [];
+  const prev = window.open;
+  window.open = (u) => { opened.push(u); };
+  let focused = 0;
+  t.textarea.focus = () => { focused++; };
+  const tap = (col, row) => {
+    const x = col * 9 + 1, y = row * 18 + 1;
+    let prevented = false;
+    t.canvas.dispatch('touchstart', { touches: [{ clientX: x, clientY: y }] });
+    t.canvas.dispatch('touchend', { touches: [], preventDefault() { prevented = true; } });
+    return prevented;
+  };
+  try {
+    t.write('see https://example.com/tap ok\r\n');
+    assert.equal(tap(8, 0), true, 'no emulated click after the tap');
+    assert.deepEqual(opened, ['https://example.com/tap']);
+    assert.equal(focused, 0, 'the keyboard stays down');
+    assert.equal(tap(0, 0), false);
+    assert.equal(opened.length, 1);
+    assert.equal(focused, 1, 'a tap off a link focuses');
+    t.write('\x1b[?1000h'); // the program reports the mouse: the tap is its click
+    tap(8, 0);
+    assert.equal(opened.length, 1, 'mouse mode: no link');
+  } finally {
+    window.open = prev;
+    t.dispose();
+  }
+});
+
+test('hover: pointer cursor and underline over plain URLs and OSC 8 links', async () => {
+  const el = new El('div'); // 100 x 20 cells of 9 x 18 px
+  const t = new Terminal(el, { fontSize: 15 });
+  const at = (col, row, mods = {}) => t.canvas.dispatch('mousemove', { clientX: col * 9 + 1, clientY: row * 18 + 1, ...mods });
+  try {
+    t.write('see https://example.com/docs. ok\r\n');
+    t.write('\x1b]8;;https://example.com/x\x07click here\x1b]8;;\x07 after\r\n');
+    flush();
+    at(10, 0);
+    assert.equal(t.canvas.style.cursor, 'pointer');
+    assert.deepEqual(t.renderer.hover, { url: 'https://example.com/docs', start: { abs: 0, col: 4 }, end: { abs: 0, col: 28 } });
+    flush(); // draws the underline without error
+    at(1, 0);
+    assert.equal(t.canvas.style.cursor, '');
+    assert.equal(t.renderer.hover, null);
+    at(3, 1); // inside the OSC 8 text
+    assert.deepEqual(t.renderer.hover, { url: 'https://example.com/x', start: { abs: 1, col: 0 }, end: { abs: 1, col: 10 } });
+    at(12, 1); // " after" is not part of it
+    assert.equal(t.renderer.hover, null);
+    at(10, 0);
+    t.canvas.dispatch('mouseleave', {});
+    assert.equal(t.renderer.hover, null);
+    assert.equal(t.canvas.style.cursor, '');
+    // new output under the pointer: the hover follows on the next frame
+    at(10, 0);
+    t.write('\x1b[2J\x1b[H');
+    flush();
+    assert.equal(t.renderer.hover, null, 'cleared screen: no link under the pointer');
+  } finally {
+    t.dispose();
+  }
+});
+
+test('mouse reporting: hover and click need Ctrl/Cmd; a plain click goes to the program', async () => {
+  const el = new El('div');
+  const t = new Terminal(el, { fontSize: 15 });
+  const sent = [];
+  t.onData = (u8) => sent.push(new TextDecoder().decode(u8));
+  const opened = [];
+  const prev = window.open;
+  window.open = (u) => { opened.push(u); };
+  const x = 10 * 9 + 1, y = 1;
+  const click = (mods) => {
+    t.canvas.dispatch('mousedown', { button: 0, detail: 1, clientX: x, clientY: y, ...mods });
+    window.dispatch('mouseup', { button: 0, clientX: x, clientY: y, ...mods });
+  };
+  try {
+    t.write('see https://example.com/docs. ok\r\n');
+    t.write('\x1b[?1000h\x1b[?1006h'); // a program (Claude Code, vim) reports the mouse
+    t.canvas.dispatch('mousemove', { clientX: x, clientY: y });
+    assert.equal(t.renderer.hover, null, 'no hover without Ctrl: a click goes to the program');
+    window.dispatch('keydown', { key: 'Control', ctrlKey: true });
+    assert.equal(t.renderer.hover?.url, 'https://example.com/docs', 'pressing Ctrl shows the link');
+    assert.equal(t.canvas.style.cursor, 'pointer');
+    window.dispatch('keyup', { key: 'Control', ctrlKey: false });
+    assert.equal(t.renderer.hover, null, 'releasing Ctrl hides it');
+    t.canvas.dispatch('mousemove', { clientX: x, clientY: y, metaKey: true });
+    assert.equal(t.renderer.hover?.url, 'https://example.com/docs', 'Cmd works too');
+
+    sent.length = 0;
+    click({});
+    assert.deepEqual(opened, [], 'a plain click does not open');
+    assert.deepEqual(sent, ['\x1b[<0;11;1M', '\x1b[<0;11;1m'], 'a plain click is reported');
+
+    sent.length = 0;
+    click({ ctrlKey: true });
+    assert.deepEqual(opened, ['https://example.com/docs'], 'Ctrl+click opens');
+    assert.deepEqual(sent, [], 'and is not reported');
+
+    click({ metaKey: true });
+    assert.deepEqual(opened.length, 2, 'Cmd+click opens');
+
+    sent.length = 0;
+    t.canvas.dispatch('mousedown', { button: 0, detail: 1, clientX: 1, clientY: 1, ctrlKey: true });
+    window.dispatch('mouseup', { button: 0, clientX: 1, clientY: 1, ctrlKey: true });
+    assert.equal(opened.length, 2, 'Ctrl+click on plain text opens nothing');
+    assert.equal(sent.length, 2, 'and is reported');
+  } finally {
+    window.open = prev;
+    t.dispose();
+  }
+});

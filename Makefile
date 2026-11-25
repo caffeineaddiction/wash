@@ -12,7 +12,7 @@ bin/%: FORCE
 
 test:
 	$(GO) test ./...
-	node --test web/test/term/*.test.mjs web/test/wash/*.test.mjs
+	node --test web/test/term/*.test.mjs web/test/wash/*.test.mjs web/test/wosh/*.test.mjs
 
 # Image from the locally built static binary (no base image to pull).
 image: bin/wash-web

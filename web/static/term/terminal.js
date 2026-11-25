@@ -4,9 +4,10 @@
 //   t.onData = (u8) => ...; t.onResize = (cols, rows) => ...;
 //   t.write(u8 | string);
 
-import { Screen, DEFAULT_THEME } from './screen.js';
+import { Screen, DEFAULT_THEME, HIDDEN } from './screen.js';
 import { CanvasRenderer } from './renderer.js';
 import { encodeKey, encodeMouse, encodePaste } from './input.js';
+import { safeURL, urlRangeAt } from './links.js';
 
 const DEFAULT_FONT = '"JetBrains Mono", "Fira Code", "Cascadia Code", "SF Mono", Menlo, Consolas, "DejaVu Sans Mono", "Liberation Mono", monospace';
 const SYNC_TIMEOUT = 150;
@@ -46,6 +47,7 @@ export class Terminal {
       fontFamily: DEFAULT_FONT, fontSize: 15, scrollback: 5000, copyOnSelect: false, ctrlCopyPaste: false,
       clipboard: true, // OSC 52 from the program may set the clipboard (off for playback)
       mouseReporting: true, // mouse modes the program sets get clicks (off for playback: they select)
+      clickOpensLinks: true, // a plain click or a tap opens a link (false: Ctrl/Cmd+click only)
       ...options,
       theme: { ...DEFAULT_THEME, ...(options.theme || {}) },
     };
@@ -59,11 +61,12 @@ export class Terminal {
 
     const s = new Screen(80, 24, { scrollback: this.opts.scrollback, decoder: browserImageDecoder, theme: this.opts.theme });
     this.screen = s;
-    s.onReply = (str) => this._emit(str);
+    this._replaying = false; // write(data, {replies: false}) in progress
+    s.onReply = (str) => { if (!this._replaying) this._emit(str); };
     s.onTitle = (t) => this.onTitle && this.onTitle(t);
     s.onBell = () => this.onBell && this.onBell();
     s.onClipboard = (text) => {
-      if (this.opts.clipboard) navigator.clipboard?.writeText(text).catch(() => {});
+      if (this.opts.clipboard && !this._replaying) navigator.clipboard?.writeText(text).catch(() => {});
     };
     s.onImage = () => this._schedule();
 
@@ -119,12 +122,19 @@ export class Terminal {
 
   // ---- public API --------------------------------------------------------------
 
-  write(data) {
+  // write(data, {replies: false}) draws data without answering the queries
+  // in it (DSR, DA, ...) or setting the clipboard (OSC 52): for replayed
+  // output whose queries were answered when they were new.
+  write(data, { replies = true } = {}) {
     if (this._disposed) return;
     const str = typeof data === 'string' ? data : this.utf8.decode(data, { stream: true });
     if (!str) return;
-    this.screen.write(str);
+    // restore, not clear: a callback (onTitle, onBell) may write mid-replay
+    const was = this._replaying;
+    this._replaying = !replies;
+    try { this.screen.write(str); } finally { this._replaying = was; }
     if (this.screen.viewOffset) { this.screen.viewOffset = 0; this.screen.dirtyAll = true; }
+    this._hoverStale = true; // the text under the pointer may have changed
     this._schedule();
   }
 
@@ -207,6 +217,7 @@ export class Terminal {
     }
     if (o.copyOnSelect !== undefined) this.opts.copyOnSelect = o.copyOnSelect;
     if (o.ctrlCopyPaste !== undefined) this.opts.ctrlCopyPaste = o.ctrlCopyPaste;
+    if (o.clickOpensLinks !== undefined) this.opts.clickOpensLinks = o.clickOpensLinks;
     this._schedule();
   }
 
@@ -244,6 +255,11 @@ export class Terminal {
       if (now - this._syncStart < SYNC_TIMEOUT) { this._schedule(); return; }
     }
     this._syncStart = 0;
+    if (this._hoverStale) { // once per frame, not per write
+      this._hoverStale = false;
+      if (this._pointer) this._hover(this._hoverMods || {});
+      else if (this.renderer.hover) this._setHover(null);
+    }
     this.renderer.selection = this._selRange();
     this.renderer.render(false);
     const b = s.buf;
@@ -310,6 +326,20 @@ export class Terminal {
 
     const c = this.canvas;
     this._on(c, 'mousedown', (e) => this._mousedown(e));
+    // link hover: pointer cursor and underline where a click opens a link
+    this._on(c, 'mousemove', (e) => {
+      this._pointer = { x: e.clientX, y: e.clientY };
+      this._hoverMods = { ctrlKey: e.ctrlKey, metaKey: e.metaKey, shiftKey: e.shiftKey, altKey: e.altKey };
+      this._hover(this._hoverMods);
+    });
+    this._on(c, 'mouseleave', () => { this._pointer = null; this._setHover(null); });
+    const modKey = (e) => {
+      if (e.key !== 'Control' && e.key !== 'Meta' && e.key !== 'Shift' && e.key !== 'Alt') return;
+      this._hoverMods = { ctrlKey: e.ctrlKey, metaKey: e.metaKey, shiftKey: e.shiftKey, altKey: e.altKey };
+      if (this._pointer) this._hover(this._hoverMods);
+    };
+    this._on(window, 'keydown', modKey);
+    this._on(window, 'keyup', modKey);
     this._on(window, 'mousemove', (e) => this._mousemove(e));
     this._on(window, 'mouseup', (e) => this._mouseup(e));
     this._on(c, 'wheel', (e) => this._wheel(e), { passive: false });
@@ -453,7 +483,11 @@ export class Terminal {
     e.preventDefault();
     this.focus();
     const cell = this.renderer.cellAt(e.clientX, e.clientY);
-    if (this._mouseReporting(e)) {
+    // Ctrl/Cmd+click on a link opens it even when the program reports the
+    // mouse; other clicks (and Ctrl/Cmd+click elsewhere) go to the program
+    const modLink = (e.ctrlKey || e.metaKey) && e.button === 0 && this._mouseReporting(e) &&
+      this._linkAt(this._abs(cell)) !== null;
+    if (this._mouseReporting(e) && !modLink) {
       if (e.button > 2) return;
       this._mouseDown = e.button;
       this._lastMouseCell = `${cell.col},${cell.row}`;
@@ -463,7 +497,10 @@ export class Terminal {
     if (e.button !== 0) return;
     const pos = this._abs(cell);
     const mode = e.detail >= 3 ? 'line' : e.detail === 2 ? 'word' : 'char';
-    this._clickStart = { x: e.clientX, y: e.clientY, link: (e.ctrlKey || e.metaKey) ? this._linkAt(pos) : null };
+    // Ctrl/Cmd+click always opens a link; a plain click does too unless
+    // clickOpensLinks is off. Shift and Alt clicks only select.
+    const plain = this.opts.clickOpensLinks && !e.shiftKey && !e.altKey;
+    this._clickStart = { x: e.clientX, y: e.clientY, link: (e.ctrlKey || e.metaKey || plain) ? this._linkAt(pos) : null };
     this._sel = { anchor: pos, head: pos, mode, active: true, moved: mode !== 'char' };
     this._mouseDown = 0;
     this.screen.dirtyAll = true;
@@ -508,7 +545,8 @@ export class Terminal {
       const cs = this._clickStart;
       if (!this._sel.moved) {
         this._clearSelection();
-        if (cs && cs.link) window.open(cs.link, '_blank', 'noopener,noreferrer');
+        const url = cs && safeURL(cs.link);
+        if (url) window.open(url, '_blank', 'noopener,noreferrer');
       } else if (this.opts.copyOnSelect) {
         const t = this.getSelection();
         if (t) navigator.clipboard?.writeText(t).catch(() => {});
@@ -576,7 +614,20 @@ export class Terminal {
     const st = this._touch;
     this._touch = null;
     if (!st) return;
-    if (!st.moved) { this.focus(); return; }
+    if (!st.moved) {
+      // a tap on a link opens it, without the keyboard popping up. A program
+      // that reports the mouse gets the tap instead (as a click).
+      if (this.opts.clickOpensLinks && !this._mouseReporting(e)) {
+        const url = safeURL(this._linkAt(this._abs(this.renderer.cellAt(st.x0, st.y0))));
+        if (url) {
+          e.preventDefault(); // no emulated click: it would open the link again
+          window.open(url, '_blank', 'noopener,noreferrer');
+          return;
+        }
+      }
+      this.focus();
+      return;
+    }
     e.preventDefault(); // no click/mousedown emulation after a drag
     let v = st.v;
     if (performance.now() - st.at > 80 || Math.abs(v) < 0.3) return;
@@ -595,10 +646,108 @@ export class Terminal {
   }
 
   _linkAt(pos) {
+    const r = this._linkRangeAt(pos);
+    return r ? r.url : null;
+  }
+
+  // _linkRangeAt: the link under pos, as {url, start:{abs,col}, end:{abs,col}}
+  // (end exclusive, the shape of a selection range), or null.
+  _linkRangeAt(pos) {
     const l = this.screen.lineAt(pos.abs);
     if (!l || pos.cell >= l.cols) return null;
     const id = l.ln[pos.cell];
-    return id ? this.screen.links.get(id) || null : null;
+    // an OSC 8 target that may not be opened, or one already forgotten,
+    // falls back to a plain URL in the text under the click
+    const url = id ? safeURL(this.screen.links.get(id)) : null;
+    if (url) return { url, ...this._osc8Extent(pos, id) };
+    return this._plainLinkAt(pos);
+  }
+
+  // _osc8Extent: the run of cells around pos carrying OSC 8 link id, across
+  // soft wraps.
+  _osc8Extent(pos, id) {
+    const s = this.screen;
+    let abs = pos.abs, col = pos.cell;
+    for (let n = 0; n < 4096; n++) { // walk back
+      const l = s.lineAt(abs);
+      if (col > 0 && l.ln[col - 1] === id) { col--; continue; }
+      const prev = col === 0 && s.lineAt(abs - 1);
+      if (prev && prev.wrapped && prev.ln[prev.cols - 1] === id) { abs--; col = prev.cols - 1; continue; }
+      break;
+    }
+    const start = { abs, col };
+    abs = pos.abs; col = pos.cell;
+    for (let n = 0; n < 4096; n++) { // walk forward
+      const l = s.lineAt(abs);
+      if (col + 1 < l.cols && l.ln[col + 1] === id) { col++; continue; }
+      const next = col + 1 >= l.cols && l.wrapped && s.lineAt(abs + 1);
+      if (next && next.ln[0] === id) { abs++; col = 0; continue; }
+      break;
+    }
+    return { start, end: { abs, col: col + 1 } };
+  }
+
+  // _plainLinkAt: a bare http(s) URL under pos, also when it wraps across
+  // lines (soft wraps only), with its cell range.
+  _plainLinkAt(pos) {
+    const s = this.screen;
+    let start = pos.abs;
+    for (let n = 0; n < 32; n++) {
+      const prev = s.lineAt(start - 1);
+      if (!prev || !prev.wrapped) break;
+      start--;
+    }
+    let text = '', at = -1;
+    const cells = []; // per character cell: {abs, col, i (index in text), w}
+    for (let abs = start, n = 0; n < 64; abs++, n++) {
+      const l = s.lineAt(abs);
+      if (!l) break;
+      for (let c = 0; c < l.cols; c++) {
+        if (l.wd[c] === 0) continue; // second half of a wide character
+        if (abs === pos.abs && c <= pos.cell) at = text.length;
+        cells.push({ abs, col: c, i: text.length, w: l.wd[c] });
+        text += l.fl[c] & HIDDEN ? ' ' : l.ch[c]; // concealed (SGR 8) text is not shown, so not linked
+      }
+      if (!l.wrapped || abs >= pos.abs + 32) break;
+    }
+    const r = at < 0 ? null : urlRangeAt(text, at);
+    if (!r) return null;
+    const inside = cells.filter((c) => c.i >= r.start && c.i < r.end);
+    const a = inside[0], b = inside[inside.length - 1];
+    return { url: r.url, start: { abs: a.abs, col: a.col }, end: { abs: b.abs, col: b.col + b.w } };
+  }
+
+  // ---- link hover ------------------------------------------------------------------
+
+  // _hover underlines the link under the pointer and shows a pointer cursor,
+  // when a click would open it: a plain click (clickOpensLinks, no mouse
+  // reporting) or Ctrl/Cmd+click (always). e: a mouse or key event with
+  // the modifier state; the pointer position is the last one seen.
+  _hover(e) {
+    const p = this._pointer;
+    let range = null;
+    if (p && this._mouseDown < 0) {
+      const mod = e.ctrlKey || e.metaKey;
+      const plain = this.opts.clickOpensLinks && !e.shiftKey && !e.altKey && !this._mouseReporting(e);
+      if (mod || plain) {
+        const cell = this.renderer.cellAt(p.x, p.y);
+        if (cell.rawRow >= 0 && cell.rawRow < this.screen.rows) {
+          range = this._linkRangeAt(this._abs(cell));
+        }
+      }
+    }
+    this._setHover(range);
+  }
+
+  _setHover(range) {
+    const old = this.renderer.hover;
+    const same = (a, b) => a === b || (a && b && a.start.abs === b.start.abs && a.start.col === b.start.col &&
+      a.end.abs === b.end.abs && a.end.col === b.end.col);
+    if (same(old, range)) return;
+    this.renderer.hover = range;
+    this.canvas.style.cursor = range ? 'pointer' : '';
+    this.screen.dirtyAll = true;
+    this._schedule();
   }
 
   // ---- selection -------------------------------------------------------------------

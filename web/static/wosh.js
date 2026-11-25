@@ -6,6 +6,13 @@
 // channel straight to the wosh daemon (signaling through washd), or over a
 // second WebSocket that washd bridges to the daemon. Output and input carry
 // stream offsets, so reconnects replay missed output and resend unacked input.
+//
+// Embedding without washd: pass mgr = null and a signal function (see
+// WoshSession). The file has no imports and no build step.
+
+// VERSION of the browser client (this file and term/). Bump it on changes an
+// embedder must know about; term/index.js carries the same value.
+export const VERSION = '0.1.0';
 
 export const F = {
   OUTPUT: 0x6f, INPUT: 0x69, ACK: 0x61, RESIZE: 0x72, REDRAW: 0x52, PING: 0x70, PONG: 0x50,
@@ -13,6 +20,7 @@ export const F = {
 };
 
 const MAX_CHUNK = 16 * 1024;
+const SIGNAL_TIMEOUT = 30000; // an embedder's signal function, like washd requests
 const enc = new TextEncoder();
 
 function u64(view, at) { return Number(view.getBigUint64(at)); }
@@ -287,7 +295,7 @@ export function serveStream(mgr, dc) {
   };
   const run = async () => {
     if (spec.resume) { raw(S.REFUSE, enc.encode('unknown stream')); return; }
-    if (spec.k !== 'build') {
+    if (spec.k !== 'build' || !mgr) {
       msg(S.ERR, enc.encode(`not supported by the wash browser client (${spec.k})`));
       msg(S.CLOSE);
       return;
@@ -312,11 +320,11 @@ export function serveStream(mgr, dc) {
 // --- transports ---------------------------------------------------------------
 
 // signal(sdp) -> answer sdp: through washd for its own sessions, through the
-// parent session's terminal for a chained hop.
-async function webrtcTransport(mgr, signal, onFrame, onDown) {
-  const h = mgr.hello;
-  const cfg = { iceServers: (h.ice || []).map((s) => ({ urls: s.urls, username: s.username, credential: s.credential })) };
-  if (h.relay) cfg.iceTransportPolicy = 'relay';
+// parent session's terminal for a chained hop, or through the embedder.
+// ice: [{urls, username, credential}]. relay: TURN only.
+async function webrtcTransport(mgr, { ice, relay }, signal, onFrame, onDown) {
+  const cfg = { iceServers: (ice || []).map((s) => ({ urls: s.urls, username: s.username, credential: s.credential })) };
+  if (relay) cfg.iceTransportPolicy = 'relay';
   const pc = new RTCPeerConnection(cfg);
   const dc = pc.createDataChannel('wosh');
   dc.binaryType = 'arraybuffer';
@@ -330,9 +338,10 @@ async function webrtcTransport(mgr, signal, onFrame, onDown) {
     const t = setTimeout(resolve, 4000);
     pc.addEventListener('icegatheringstatechange', () => { if (pc.iceGatheringState === 'complete') { clearTimeout(t); resolve(); } });
   });
-  let answer;
-  try { answer = await signal(pc.localDescription.sdp); } catch (e) { pc.close(); throw e; }
-  await pc.setRemoteDescription({ type: 'answer', sdp: answer });
+  try {
+    const answer = await signal(pc.localDescription.sdp);
+    await pc.setRemoteDescription({ type: 'answer', sdp: answer });
+  } catch (e) { pc.close(); throw e; }
   await new Promise((resolve, reject) => {
     const t = setTimeout(() => { reject(new Error('WebRTC did not connect')); }, 8000);
     dc.onopen = () => { clearTimeout(t); resolve(); };
@@ -353,7 +362,7 @@ async function webrtcTransport(mgr, signal, onFrame, onDown) {
   };
 }
 
-async function bridgeTransport(mgr, id, size, rxOut, take, onFrame, onDown) {
+async function bridgeTransport(mgr, id, size, rxOut, cid, take, onFrame, onDown) {
   const { ticket } = await mgr.request({ t: 'ticket' });
   const { ws } = await openSocket(ticket, mgr.host);
   let down = false;
@@ -365,7 +374,7 @@ async function bridgeTransport(mgr, id, size, rxOut, take, onFrame, onDown) {
       else if (m.t === 'err') reject(new Error(m.err));
     };
     ws.onclose = (ev) => reject(new Error(ev.reason || 'bridge closed'));
-    ws.send(JSON.stringify({ t: 'bridge', rid: 1, id, cols: size.cols, rows: size.rows, rx_out: rxOut, cid: mgr.cid, take }));
+    ws.send(JSON.stringify({ t: 'bridge', rid: 1, id, cols: size.cols, rows: size.rows, rx_out: rxOut, cid, take }));
   });
   ws.onmessage = (ev) => { if (typeof ev.data !== 'string') onFrame(new Uint8Array(ev.data)); };
   ws.onclose = () => { if (!down) { down = true; onDown(); } };
@@ -383,10 +392,30 @@ export class WoshSession {
   // term: Terminal (write, onData, onResize, cols, rows)
   // parent + key: a chained hop (`wosh HOST` inside the parent session),
   // reached directly over WebRTC and signaled through the parent's terminal.
-  constructor(mgr, id, term, { transport = 'auto', onState = () => {}, onExit = () => {}, parent = null, key = null } = {}) {
+  //
+  // Embedding without washd: mgr = null, and
+  //   signal({sdp, cols, rows, rx_out, cid, take, join, ice, relay}) -> Promise<answer sdp>
+  //     relays the offer to the daemon (e.g. POST to your server, which
+  //     writes {"t":"offer",...} to the daemon's control socket). The daemon
+  //     reads join, not take: forward join (watch if another client has
+  //     control), and ice and relay so both ends use the same ICE servers.
+  //     It times out after 30 s. Throw an Error whose message contains
+  //     "gone" to end the session for good.
+  //   cid: this client instance, for roles. Keep it per tab across reloads
+  //     (e.g. in sessionStorage) so a reloaded tab keeps control. Default: a
+  //     new random id per WoshSession.
+  //   ice: ICE servers for the RTCPeerConnection (default: none, host
+  //     candidates only). relay: with ice, use TURN only.
+  // The transport is WebRTC only (the bridge needs washd).
+  constructor(mgr, id, term, { transport = 'auto', onState = () => {}, onExit = () => {}, parent = null, key = null,
+    signal = null, cid = null, ice = null, relay = false } = {}) {
+    if (signal != null && typeof signal !== 'function') throw new Error('WoshSession: signal must be a function');
+    if (!mgr && !signal) throw new Error('WoshSession: pass a manager or a signal function');
     this.mgr = mgr; this.id = id; this.term = term;
-    this.mode = parent ? 'webrtc' : transport; this.onState = onState; this.onExit = onExit;
+    this.mode = parent || !mgr ? 'webrtc' : transport; this.onState = onState; this.onExit = onExit;
     this.parent = parent; this.key = key;
+    this.signalFn = signal; this.ice = ice; this.iceRelay = relay; // not this.relay: that is relay()
+    this.cid = cid || (mgr && mgr.cid) || randomHex(8);
     this.filter = new OSCFilter();
     this.token = null;          // from the daemon's info frame: proves chained-hop hellos
     this.waiters = new Map();   // hop id -> resolve(answer|err msg)
@@ -395,6 +424,11 @@ export class WoshSession {
     this.synced = false;        // got this link's first ack
     this.everSynced = false;
     this.rxOut = 0;              // output received up to
+    // output below this offset was in the ring before this tab first
+    // connected: replay (no query replies). Set by the info frame of each
+    // link while this tab has no output yet (rx_out 0), then kept across
+    // reconnects.
+    this.replayEnd = 0;
     this.inBase = 0;             // input acknowledged up to
     this.inBuf = new Uint8Array(0); // unacknowledged input, starting at inBase
     this.tr = null; this.closed = false; this.exited = false;
@@ -418,7 +452,10 @@ export class WoshSession {
       this.onState({ state: 'connecting' });
       try {
         this.synced = false; this.flushPending = true;
-        this.tr = await this.open();
+        const tr = await this.open();
+        // closed (or ended) while the link was coming up: drop it
+        if (this.closed || this.exited) { tr.close(); return; }
+        this.tr = tr;
         this.take = false; // reconnects keep whatever role we have
         // the first ack may have arrived while open() was finishing
         if (this.synced && this.flushPending) { this.flushPending = false; this.flushInput(); }
@@ -431,6 +468,7 @@ export class WoshSession {
         this.startPing();
         return;
       } catch (e) {
+        if (this.closed || this.exited) return; // closed while connecting: nothing to retry
         this.onState({ state: 'down', error: e.message });
         if (/no session|session not found|gone/.test(e.message)) { this.exited = true; this.onExit(null, e.message); return; }
         if (this.parent && /signal timeout/.test(e.message) && ++this.sigTimeouts >= 2) {
@@ -444,16 +482,43 @@ export class WoshSession {
     }
   }
 
-  // signal sends an offer and returns the answer's SDP.
+  // signal sends an offer and returns the answer's SDP. An answer that
+  // arrives after close() is refused, so the RTCPeerConnection never opens:
+  // a late peer with this cid would replace the one a new WoshSession on
+  // the same cid (a resumed pane, a reload) has just opened.
   signal(sdp) {
+    return this.sendOffer(sdp).then((a) => {
+      if (this.closed || this.exited) throw new Error('closed while connecting');
+      return a;
+    });
+  }
+
+  sendOffer(sdp) {
     const { cols, rows } = this.size();
-    if (!this.parent) {
-      return this.mgr.request({ t: 'offer', id: this.id, sdp, cols, rows, rx_out: this.rxOut, cid: this.mgr.cid, take: this.take }).then((a) => a.sdp);
+    if (!this.parent && this.signalFn) {
+      const { ice, relay } = this.iceConfig();
+      const req = { sdp, cols, rows, rx_out: this.rxOut, cid: this.cid, take: this.take, join: !this.take, ice, relay };
+      return new Promise((resolve, reject) => {
+        const t = setTimeout(() => reject(new Error('offer: timed out')), SIGNAL_TIMEOUT);
+        Promise.resolve().then(() => this.signalFn(req)).then((answer) => {
+          clearTimeout(t);
+          if (typeof answer === 'string' && answer) resolve(answer);
+          else reject(new Error('offer: the signal function returned no answer SDP'));
+        }, (e) => {
+          clearTimeout(t);
+          // connect() reads e.message ("gone" ends the session)
+          reject(e instanceof Error ? e : new Error(e == null ? 'offer failed' : String(e)));
+        });
+      });
     }
-    const h = this.mgr.hello;
+    if (!this.parent) {
+      return this.mgr.request({ t: 'offer', id: this.id, sdp, cols, rows, rx_out: this.rxOut, cid: this.cid, take: this.take }).then((a) => a.sdp);
+    }
+    const h = (this.mgr && this.mgr.hello) || {};
+    const ice = this.iceConfig();
     return this.parent.relay({
-      t: 'offer', id: this.id, key: this.key, sdp, ice: h.ice || [], relay: !!h.relay,
-      term: 'xterm-256color', cols, rows, rx_out: this.rxOut, user: h.user, cid: this.mgr.cid, join: !this.take,
+      t: 'offer', id: this.id, key: this.key, sdp, ice: ice.ice, relay: ice.relay,
+      term: 'xterm-256color', cols, rows, rx_out: this.rxOut, user: h.user, cid: this.cid, join: !this.take,
       env: { COLORTERM: 'truecolor', TERM_PROGRAM: 'wash' },
     }).then((a) => {
       if (a.t === 'err') throw new Error(a.err || 'hop refused');
@@ -475,19 +540,29 @@ export class WoshSession {
   // say sends a one-way message to a relay parked in this session (bye).
   say(msg) { this.input(encodeInput(msg)); }
 
+  // iceConfig: the embedder's ICE list and relay flag, else washd's (hello).
+  // urls goes out as a list: the daemon rejects a bare string, which
+  // RTCPeerConnection would take.
+  iceConfig() {
+    const h = (this.mgr && this.mgr.hello) || {};
+    const ice = this.ice || h.ice || [];
+    const relay = this.ice ? !!this.iceRelay : !!h.relay;
+    return { ice: ice.map((s) => ({ ...s, urls: Array.isArray(s.urls) ? s.urls : [s.urls] })), relay };
+  }
+
   async open() {
     const down = () => this.linkDown();
     const onFrame = (b) => this.frame(b);
     if (this.mode === 'webrtc' || (this.mode === 'auto' && !this.preferBridge)) {
       try {
-        return await webrtcTransport(this.mgr, (sdp) => this.signal(sdp), onFrame, down);
+        return await webrtcTransport(this.mgr, this.iceConfig(), (sdp) => this.signal(sdp), onFrame, down);
       } catch (e) {
         if (this.mode === 'webrtc') throw e;
         console.warn('wash: WebRTC failed, using the WebSocket bridge:', e.message);
         this.preferBridge = true; // until a reload; roaming back is cheap to retry later
       }
     }
-    return bridgeTransport(this.mgr, this.id, this.size(), this.rxOut, this.take, onFrame, down);
+    return bridgeTransport(this.mgr, this.id, this.size(), this.rxOut, this.cid, this.take, onFrame, down);
   }
 
   // takeControl makes this tab the one that types into the session; the
@@ -562,8 +637,19 @@ export class WoshSession {
         if (end <= this.rxOut) return;
         if (off < this.rxOut) data = data.subarray(this.rxOut - off);
         this.rxOut = end;
-        const { out, msgs } = this.filter.write(data);
-        if (out.length) this.term.write(out);
+        // output below replayEnd was in the ring before this tab connected:
+        // its terminal queries were answered back then, so draw it without
+        // replying. Output made while a resumed link was down still answers.
+        const quiet = Math.max(0, Math.min(this.replayEnd - (end - data.length), data.length));
+        const msgs = [];
+        for (const [part, replies] of [[data.subarray(0, quiet), false], [data.subarray(quiet), true]]) {
+          if (!part.length) continue;
+          const r = this.filter.write(part);
+          if (r.out.length) this.term.write(r.out, { replies });
+          // replayed signals are stale (answers to old offers, typeahead that
+          // was delivered then); only a hello can matter (a relay still parked)
+          for (const m of r.msgs) if (replies || m.t === 'hello') msgs.push(m);
+        }
         for (const m of msgs) {
           if ((m.t === 'answer' || m.t === 'err') && this.waiters.has(m.id)) this.waiters.get(m.id)(m);
           else this.onSignal(m);
@@ -574,6 +660,10 @@ export class WoshSession {
         try {
           const c = JSON.parse(new TextDecoder().decode(b.subarray(1)));
           if (c.op === 'info' && c.token) this.token = c.token;
+          // info comes before any output on a link, so rxOut is where it
+          // starts. With no output yet, the newest info counts: a controller
+          // may have answered more output since an earlier link's info.
+          if (c.op === 'info' && this.rxOut === 0) this.replayEnd = c.out > 0 ? c.out : 0;
           if (c.op === 'role') this.setRole(c.role);
           if (c.op === 'size' && c.cols > 0 && c.rows > 0) { this.shared = { cols: c.cols, rows: c.rows }; this.layout(); }
         } catch {}

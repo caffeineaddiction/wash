@@ -13,7 +13,7 @@ bins() {
 }
 case "${1:-all}" in
 all) bins ;;
-test) $GO test ./... && node --test web/test/term/*.test.mjs web/test/wash/*.test.mjs ;;
+test) $GO test ./... && node --test web/test/term/*.test.mjs web/test/wash/*.test.mjs web/test/wosh/*.test.mjs ;;
 image) bins && podman build -t "$IMAGE" -f Containerfile . ;;
 run) exec deploy/dev.sh "${2:-start}" ;;  # local test = the real quadlet, see deploy/README.md
 install)

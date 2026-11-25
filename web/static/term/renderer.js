@@ -21,6 +21,7 @@ export class CanvasRenderer {
     this.fontSize = fontSize;
     this.rowLines = [];
     this.selection = null; // {start:{abs,col}, end:{abs,col}} end exclusive
+    this.hover = null;     // link under the pointer, same shape: underlined
     this.focused = false;
     this.prevCursor = '';
     this.prevCursorRow = -1;
@@ -226,6 +227,16 @@ export class CanvasRenderer {
       if (hasDeco) this._deco(line, x, px, y0, cw * w, ul, fl, fg);
     }
     if (alpha !== 1) ctx.globalAlpha = 1;
+    // the link under the pointer (terminal sets hover)
+    const hv = this.hover;
+    if (hv && abs >= hv.start.abs && abs <= hv.end.abs) {
+      const st = abs === hv.start.abs ? hv.start.col : 0;
+      const en = abs === hv.end.abs ? hv.end.col : n;
+      if (en > st) {
+        ctx.fillStyle = hex(s.modes.reverse ? s.bgColor : s.fgColor);
+        ctx.fillRect(st * cw, Math.min(y0 + ch - this.lw, y0 + this.baseline + this.lw + 1), (en - st) * cw, this.lw);
+      }
+    }
     this._drawImages(pls, r, abs, false);
     if (curX >= 0) this._cursor(line, Math.min(curX, n - 1), y0);
     ctx.restore();

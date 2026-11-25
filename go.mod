@@ -11,7 +11,7 @@ require (
 	github.com/pion/ice/v4 v4.4.8
 	github.com/pion/webrtc/v4 v4.2.26
 	golang.org/x/sys v0.49.0
-	golang.org/x/term v0.46.0
+	golang.org/x/term v0.47.0
 	modernc.org/sqlite v1.62.0
 )
 
@@ -56,8 +56,8 @@ require (
 	github.com/wlynxg/anet v0.0.5 // indirect
 	github.com/x448/float16 v0.8.4 // indirect
 	github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e // indirect
-	golang.org/x/crypto v0.57.0 // indirect
-	golang.org/x/net v0.58.0 // indirect
+	golang.org/x/crypto v0.58.0 // indirect
+	golang.org/x/net v0.62.0 // indirect
 	golang.org/x/sync v0.24.0 // indirect
 	golang.org/x/time v0.14.0 // indirect
 	modernc.org/libc v1.80.1 // indirect
